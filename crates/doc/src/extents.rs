@@ -103,6 +103,20 @@ pub fn extent_bounds(d: &Drawing, e: &Entity) -> Bounds2 {
     bounds_of(d, e, 0, true)
 }
 
+/// Block-content bounds by block name and depth, shared by [`entity_bounds_cached`] calls.
+pub type BlockBoundsCache<'a> = HashMap<(&'a str, usize), Bounds2>;
+
+/// [`entity_bounds`] of a top-level entity, with block-content bounds kept in `cache`
+/// across calls, so measuring every entity of a drawing visits each block definition once instead
+/// of once per reference. The renderer measures this way to leave out what lies off screen.
+pub fn entity_bounds_cached<'a>(d: &'a Drawing, e: &Entity, cache: &mut BlockBoundsCache<'a>) -> Bounds2 {
+    match d.anno_draw(e) {
+        crate::AnnoDraw::Plain => bounds_in(d, e, 0, cache, false),
+        crate::AnnoDraw::Hidden => Bounds2::EMPTY,
+        crate::AnnoDraw::Scaled(f) => bounds_in(d, &crate::anno_scaled(e, f), 0, cache, false),
+    }
+}
+
 fn bounds_of(d: &Drawing, e: &Entity, depth: usize, off_counts: bool) -> Bounds2 {
     // A top-level annotative object measures as it draws at the current annotation scale.
     if depth == 0 {
