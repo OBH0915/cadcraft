@@ -242,6 +242,36 @@ pub fn build_mesh(list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) ->
 /// the callback's `dash` dashes the lines) outlined. A wipeout is always outlined, since filling it
 /// would hide the drawing; infinite lines are left to the CPU (they are clipped per frame).
 pub fn build_highlight_mesh(list: &DisplayList, prims: &[usize], origin: Vec2, color: [u8; 4], width: f32, dashed: bool) -> MeshData {
+    // A site plan held in one block is millions of segments; hovering it built them
+    // on one core (about 86 ms each time the hovered object changed). Split by primitive across
+    // the cores and joined in order, the data is the same.
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get).min(16);
+    if threads > 1 && prims.len() >= HIGHLIGHT_PARALLEL_FROM {
+        let parts: Vec<MeshData> = std::thread::scope(|scope| {
+            let handles: Vec<_> = prims
+                .chunks(prims.len().div_ceil(threads))
+                .map(|part| scope.spawn(move || build_highlight_part(list, part, origin, color, width, dashed)))
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        if parts.len() == prims.chunks(prims.len().div_ceil(threads)).len() {
+            let mut m = MeshData::default();
+            m.quads.reserve(parts.iter().map(|p| p.quads.len()).sum());
+            m.tris.reserve(parts.iter().map(|p| p.tris.len()).sum());
+            for p in parts {
+                m.quads.extend_from_slice(&p.quads);
+                m.tris.extend_from_slice(&p.tris);
+            }
+            return m;
+        }
+    }
+    build_highlight_part(list, prims, origin, color, width, dashed)
+}
+
+/// Primitives at which [`build_highlight_mesh`] spreads the work over the cores.
+const HIGHLIGHT_PARALLEL_FROM: usize = 4096;
+
+fn build_highlight_part(list: &DisplayList, prims: &[usize], origin: Vec2, color: [u8; 4], width: f32, dashed: bool) -> MeshData {
     let mut m = MeshData::default();
     for prim in prims.iter().filter_map(|&i| list.prims.get(i)) {
         let pts = list.points(prim);
@@ -350,6 +380,9 @@ pub const LAYER_HIGHLIGHT: usize = 2;
 pub const LAYER_VIEWPORT: usize = 3;
 /// The outline of the active viewport when it is clipped (stencil only, see [`Stencil`]).
 pub const LAYER_MASK: usize = 4;
+/// The rollover highlight of the object under the cursor, rebuilt only when that
+/// object, the drawing or the view origin changes (it was redrawn as egui shapes every frame).
+pub const LAYER_HOVER: usize = 5;
 
 /// Opacity of filled areas in the selection and hover highlight: see-through, so the lines and
 /// text on (and under) a highlighted hatch stay visible, as the reference app's dot pattern does.
@@ -591,7 +624,7 @@ impl Resources {
                 quad: pipeline("cad_clip_quads", "vs_quad", TriangleList, instance_layout(), Stencil::Inside),
             }),
             linear_out: target.format.is_srgb(),
-            layers: (0..=LAYER_MASK).map(|_| layer()).collect(),
+            layers: (0..=LAYER_HOVER).map(|_| layer()).collect(),
         }
     }
 }
@@ -872,6 +905,19 @@ mod tests {
         }
         let m = build_highlight_mesh(&l, &[1], Vec2::ZERO, [1, 2, 3, 255], 1.5, false);
         assert_eq!((m.tri_vertices(), m.quad_instances()), (0, 3));
+    }
+
+    #[test]
+    fn a_large_highlight_built_on_all_cores_is_the_one_built_on_one() {
+        let l = list();
+        // Many primitives (past the parallel threshold) over the test list's polyline and fill.
+        let prims: Vec<usize> = (0..HIGHLIGHT_PARALLEL_FROM * 3 + 7).map(|i| i % 3).collect();
+        for dashed in [false, true] {
+            let all = build_highlight_mesh(&l, &prims, Vec2::new(5.0, -3.0), [1, 2, 3, 255], 1.5, dashed);
+            let one = build_highlight_part(&l, &prims, Vec2::new(5.0, -3.0), [1, 2, 3, 255], 1.5, dashed);
+            assert!(!all.quads.is_empty());
+            assert_eq!((all.quads, all.tris, all.lines), (one.quads, one.tris, one.lines));
+        }
     }
 
     #[test]

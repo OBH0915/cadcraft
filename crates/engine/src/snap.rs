@@ -449,7 +449,7 @@ fn gather_in(
         sink.object(&e.kind, None);
         // A block reference snaps to the objects inside it, placed by its transform.
         if let EntityKind::Insert(ins) = &e.kind {
-            block_leaves(d, ins, &Mat3::IDENTITY, 0, &mut budget, frozen, &mut |k, m| sink.object(k, Some(m)));
+            block_leaves(d, ins, &Mat3::IDENTITY, 0, &mut budget, frozen, Some(&probe), &mut |k, m| sink.object(k, Some(m)));
         }
         if let EntityKind::Dimension(dm) = &e.kind {
             sink.dimension(d, dm, &mut budget, frozen);
@@ -552,6 +552,9 @@ fn snap_score(mode: u32, point: Vec2, cursor: Vec2, aperture: f64) -> f64 {
 
 /// Upper bound on the block-reference objects one snap query looks at (hostile files).
 const MAX_BLOCK_LEAVES: usize = 20_000;
+
+/// Blocks with this many objects or more are culled to the cursor when snapping.
+const CULL_LEAVES_FROM: usize = 64;
 
 /// Collects snap candidates and the primitives near the cursor.
 struct Sink<'a> {
@@ -715,7 +718,7 @@ impl Sink<'_> {
                     col_spacing: 0.0,
                     row_spacing: 0.0,
                 };
-                block_leaves(d, &ins, &Mat3::IDENTITY, 0, budget, frozen, &mut |k, m| self.object(k, Some(m)));
+                block_leaves(d, &ins, &Mat3::IDENTITY, 0, budget, frozen, Some(&self.probe.clone()), &mut |k, m| self.object(k, Some(m)));
             }
             None => {
                 let g = cadcraft_render::dimension_in(d, dm);
@@ -760,7 +763,17 @@ fn dim_def_points(dm: &cadcraft_doc::Dimension) -> Vec<Vec2> {
 /// Calls `f` with each object drawn by a block reference and the transform placing it, nested
 /// references expanded (within [`MAX_BLOCK_DEPTH`] levels and `budget` objects); objects that
 /// aren't drawn (hidden, on a layer that is off or frozen, attribute definitions) are left out.
-fn block_leaves(d: &Drawing, ins: &Insert, m: &Mat3, depth: usize, budget: &mut usize, frozen: &[String], f: &mut dyn FnMut(&EntityKind, &Mat3)) {
+#[allow(clippy::too_many_arguments)]
+fn block_leaves(
+    d: &Drawing,
+    ins: &Insert,
+    m: &Mat3,
+    depth: usize,
+    budget: &mut usize,
+    frozen: &[String],
+    probe: Option<&Bounds2>,
+    f: &mut dyn FnMut(&EntityKind, &Mat3),
+) {
     if depth >= MAX_BLOCK_DEPTH {
         return;
     }
@@ -778,7 +791,24 @@ fn block_leaves(d: &Drawing, ins: &Insert, m: &Mat3, depth: usize, budget: &mut 
             *budget -= 1;
             let off = Vec2::new(ins.col_spacing * f64::from(c), ins.row_spacing * f64::from(r)).rotate(ins.rotation);
             let mm = m.then_before(Mat3::translate(off).then_before(ins.transform(blk.base.xy())));
-            for be in blk.entities.iter() {
+            // In a large block only the objects near the cursor can be snapped to;
+            // the rest are skipped without spending the budget, so a site plan held in one block
+            // snaps where the cursor is instead of to its first objects only.
+            let local = probe.filter(|_| blk.entities.len() >= CULL_LEAVES_FROM).and_then(|pb| {
+                let inv = mm.inverse()?;
+                Some(Bounds2::from_points(pb.corners().iter().map(|c| inv.apply(*c))))
+            });
+            // Only the objects near the cursor (from the block's grid), else all of them.
+            let index = local.map(|_| cadcraft_render::block_index(d, blk));
+            let near: Option<Vec<usize>> = match (index.as_ref(), local.as_ref()) {
+                (Some(ix), Some(l)) => Some(ix.near(l)),
+                _ => None,
+            };
+            let picked: Box<dyn Iterator<Item = &std::sync::Arc<cadcraft_doc::Entity>>> = match (index.as_ref(), near.as_ref()) {
+                (Some(ix), Some(n)) => Box::new(n.iter().filter_map(|&i| ix.entities.get(i))),
+                _ => Box::new(blk.entities.iter()),
+            };
+            for be in picked {
                 if *budget == 0 {
                     return;
                 }
@@ -791,7 +821,7 @@ fn block_leaves(d: &Drawing, ins: &Insert, m: &Mat3, depth: usize, budget: &mut 
                 }
                 match &be.kind {
                     EntityKind::AttDef(_) => {}
-                    EntityKind::Insert(inner) => block_leaves(d, inner, &mm, depth + 1, budget, frozen, f),
+                    EntityKind::Insert(inner) => block_leaves(d, inner, &mm, depth + 1, budget, frozen, probe, f),
                     k => f(k, &mm),
                 }
             }
@@ -1342,5 +1372,37 @@ mod tests {
         let solved = resolve_deferred(LineEnd::Deferred(d_arc), LineEnd::Deferred(d_circle)).unwrap();
         assert!(solved.0.near(Vec2::new(0.0, 5.0), 1e-9), "expected the belt tangent on the top arc, got {:?}", solved.0);
         assert!(solved.1.near(Vec2::new(10.0, 5.0), 1e-9));
+    }
+
+    /// In a block of 30 000 lines (more than the snap budget) the cursor snaps to
+    /// a line near it at the far end of the block, and picking finds the reference there.
+    #[test]
+    fn a_huge_block_snaps_and_picks_where_the_cursor_is() {
+        use cadcraft_doc::{Block, Common, Entity, Handle, Line};
+        use cadcraft_geom::Vec3;
+        let mut d = Drawing::new_metric();
+        let mut blk = Block::new("SITE");
+        for i in 0..30_000u64 {
+            let x = i as f64 * 10.0;
+            blk.entities.push(Entity::new(Handle(i + 1), EntityKind::Line(Line { a: Vec3::new(x, 0.0, 0.0), b: Vec3::new(x + 5.0, 0.0, 0.0) })));
+        }
+        d.blocks.insert("SITE".into(), std::sync::Arc::new(blk));
+        let ins = Insert {
+            block: "SITE".into(),
+            insert: Vec3::new(0.0, 0.0, 0.0),
+            scale: Vec3::new(1.0, 1.0, 1.0),
+            rotation: 0.0,
+            attribs: vec![],
+            cols: 1,
+            rows: 1,
+            col_spacing: 0.0,
+            row_spacing: 0.0,
+        };
+        let h = d.add(&Space::Model, Common::default(), EntityKind::Insert(ins)).unwrap();
+        // The last line runs from 299 990 to 299 995.
+        let hit = osnap(&d, &Space::Model, Vec2::new(299_995.2, 0.1), 0.5, mode::END, None, false).expect("a snap at the far end");
+        assert!(hit.point.near(Vec2::new(299_995.0, 0.0), 1e-9), "{:?}", hit.point);
+        assert_eq!(crate::select::pick(&d, &Space::Model, Vec2::new(299_992.0, 0.1), 0.5), Some(h));
+        assert_eq!(crate::select::pick(&d, &Space::Model, Vec2::new(299_997.5, 0.1), 0.5), None, "between two lines");
     }
 }

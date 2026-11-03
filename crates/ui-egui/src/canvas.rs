@@ -74,7 +74,8 @@ fn same_content(a: &ListKey, b: &ListKey) -> bool {
 
 #[derive(Default)]
 pub struct CanvasState {
-    pub list: Option<DisplayList>,
+    /// Shared, so a worker thread can build a large highlight from it without a copy.
+    pub list: Option<std::sync::Arc<DisplayList>>,
     key: ListKey,
     /// The area `list` was built for (hatch patterns exist only inside it); a view leaving it
     /// rebuilds the list.
@@ -104,6 +105,11 @@ pub struct CanvasState {
     hl_origin: Vec2,
     /// Selected infinite lines (clipped and drawn on the CPU each frame).
     hl_infinite: Vec<usize>,
+    /// The rollover highlight on the GPU, as `hl_*` are for the selection.
+    hv_key: Option<u64>,
+    hv_slot: crate::gpu::MeshSlot,
+    hv_origin: Vec2,
+    hv_infinite: Vec<usize>,
     /// The selection and hover highlights inside the active MSPACE viewport (see [`VpHighlight`]).
     vp_sel: VpHighlight,
     vp_hover: VpHighlight,
@@ -202,7 +208,7 @@ impl CanvasState {
             self.mesh_ms = m.ms;
             self.infinite = m.infinite;
         }
-        self.list = Some(built.list);
+        self.list = Some(std::sync::Arc::new(built.list));
         self.key = key;
         self.window = window;
         self.build_ms = built.build_ms;
@@ -417,34 +423,75 @@ fn paint_content_highlights(frame: &mut CanvasPaint<'_>, bg: Rgb, sel: &[Handle]
                     let list_id = c.vp_sel.list_gen | 1 << 63;
                     let stencil = if masked { crate::gpu::Stencil::Inside } else { crate::gpu::Stencil::Off };
                     let hl = (&mut c.hl_key, &c.hl_slot, &mut c.hl_origin, &mut c.hl_infinite);
-                    draw_highlight_gpu(&clipped, &xf, list, list_id, all, sel, t.selection, look, hl, stencil);
+                    draw_highlight_gpu(&clipped, &xf, list, None, list_id, all, sel, t.selection, look, hl, stencil, crate::gpu::LAYER_HIGHLIGHT);
                     draw_highlight(&clipped, &xf, list, &c.hl_infinite, t.selection, look);
                 } else {
                     draw_highlight(&clipped, &xf, list, &all(), t.selection, look);
                 }
             }
         }
-    } else if let CanvasState { list: Some(list), list_gen, prim_index, hover, gpu, hl_key, hl_slot, hl_origin, hl_infinite, .. } = &mut app.canvas {
+    } else if let CanvasState {
+        list: Some(list),
+        list_gen,
+        prim_index,
+        hover,
+        gpu,
+        hl_key,
+        hl_slot,
+        hl_origin,
+        hl_infinite,
+        hv_key,
+        hv_slot,
+        hv_origin,
+        hv_infinite,
+        ..
+    } = &mut app.canvas
+    {
         if let Some(h) = *hover
             && !sel.contains(&h)
         {
-            draw_highlight(painter, &xf, list, &prim_index.prims(*list_gen, list, &[h]), t.hover, preview_look);
+            if gpu.is_some() {
+                // On the GPU, built once per hovered object, not every frame.
+                let hv = (hv_key, &*hv_slot, hv_origin, &mut *hv_infinite);
+                let list_id = *list_gen;
+                let shared: &std::sync::Arc<DisplayList> = list;
+                draw_highlight_gpu(
+                    painter,
+                    &xf,
+                    shared,
+                    Some(shared),
+                    list_id,
+                    || prim_index.prims(list_id, shared, &[h]),
+                    &[h],
+                    t.hover,
+                    preview_look,
+                    hv,
+                    crate::gpu::Stencil::Off,
+                    crate::gpu::LAYER_HOVER,
+                );
+                draw_highlight(painter, &xf, list, hv_infinite, t.hover, preview_look);
+            } else {
+                draw_highlight(painter, &xf, list, &prim_index.prims(*list_gen, list, &[h]), t.hover, preview_look);
+            }
         }
         if let Some(look) = selection_look {
             if gpu.is_some() && !sel.is_empty() {
                 let list_id = *list_gen;
                 let hl = (hl_key, &*hl_slot, hl_origin, &mut *hl_infinite);
+                let shared: &std::sync::Arc<DisplayList> = list;
                 draw_highlight_gpu(
                     painter,
                     &xf,
-                    list,
+                    shared,
+                    Some(shared),
                     list_id,
-                    || prim_index.prims(list_id, list, sel),
+                    || prim_index.prims(list_id, shared, sel),
                     sel,
                     t.selection,
                     look,
                     hl,
                     crate::gpu::Stencil::Off,
+                    crate::gpu::LAYER_HIGHLIGHT,
                 );
                 draw_highlight(painter, &xf, list, hl_infinite, t.selection, look);
             } else {

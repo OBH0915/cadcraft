@@ -8,6 +8,13 @@ use crate::{Accept, Prompt};
 
 /// Polylines approximating an entity for hit testing, tessellated at `tol`.
 pub fn hit_polylines(d: &Drawing, e: &Entity, tol: f64) -> Vec<Vec<Vec2>> {
+    hit_polylines_near(d, e, tol, None)
+}
+
+/// [`hit_polylines`], only near `near` (world coordinates) for block references, dimensions and
+/// multileaders: hovering over a site plan held in one huge block built that whole block at every
+/// mouse move, though the parts away from the cursor can't be hit.
+pub fn hit_polylines_near(d: &Drawing, e: &Entity, tol: f64, near: Option<Bounds2>) -> Vec<Vec<Vec2>> {
     match &e.kind {
         EntityKind::Text(_)
         | EntityKind::MText(_)
@@ -19,7 +26,9 @@ pub fn hit_polylines(d: &Drawing, e: &Entity, tol: f64) -> Vec<Vec<Vec2>> {
         | EntityKind::MLeader(_)
         | EntityKind::Image(_) => {
             // Text-like objects are hit inside their box.
-            let b = entity_bounds(d, e, 0);
+            // The last screen build measured most model-space objects already: a site plan
+            // held in one huge block is not measured again at every mouse move.
+            let b = cadcraft_render::known_bounds(d, e).unwrap_or_else(|| entity_bounds(d, e, 0));
             if b.is_empty() {
                 return Vec::new();
             }
@@ -29,7 +38,7 @@ pub fn hit_polylines(d: &Drawing, e: &Entity, tol: f64) -> Vec<Vec<Vec2>> {
                 let list = cadcraft_render::build_entities(
                     d,
                     std::iter::once(e),
-                    &cadcraft_render::Options { tolerance: tol, text: false, linetypes: false, ..Default::default() },
+                    &cadcraft_render::Options { tolerance: tol, text: false, linetypes: false, view: near, ..Default::default() },
                 );
                 v = list.prims.iter().map(|p| list.points(p).to_vec()).collect();
                 v.push(vec![c[0], c[1], c[2], c[3], c[0]]);
@@ -86,7 +95,19 @@ fn dist_to_polyline(pts: &[Vec2], p: Vec2) -> f64 {
 
 /// Distance from `p` to the entity (0 inside text boxes and solid fills).
 pub fn entity_distance(d: &Drawing, e: &Entity, p: Vec2, tol: f64) -> f64 {
-    let polys = hit_polylines(d, e, tol);
+    entity_distance_near(d, e, p, tol, None)
+}
+
+/// [`entity_distance`] for a pick that only cares within `reach` of `p`: the parts
+/// of a block reference farther away are not built, so the answer is exact up to `reach` (and
+/// may be larger than the true distance beyond it).
+pub(crate) fn entity_distance_within(d: &Drawing, e: &Entity, p: Vec2, tol: f64, reach: f64) -> f64 {
+    let near = (reach.is_finite() && reach > 0.0 && p.is_finite()).then(|| Bounds2::new(p, p).expand(reach * 2.0));
+    entity_distance_near(d, e, p, tol, near)
+}
+
+fn entity_distance_near(d: &Drawing, e: &Entity, p: Vec2, tol: f64, near: Option<Bounds2>) -> f64 {
+    let polys = hit_polylines_near(d, e, tol, near);
     let mut best = polys.iter().map(|pl| dist_to_polyline(pl, p)).fold(f64::INFINITY, f64::min);
     let filled = matches!(e.kind, EntityKind::Text(_) | EntityKind::MText(_) | EntityKind::AttDef(_) | EntityKind::Table(_))
         || matches!(e.kind, EntityKind::Tolerance(_));
@@ -204,7 +225,7 @@ pub(crate) fn pick_with(d: &Drawing, space: &Space, ix: &Option<std::sync::Arc<S
         if !infinite && !bounds_of(d, e, known).expand(aperture).intersects(&probe) {
             continue;
         }
-        if entity_distance(d, e, p, aperture / 4.0) <= aperture {
+        if entity_distance_within(d, e, p, aperture / 4.0, aperture) <= aperture {
             return Some(e.handle);
         }
     }
@@ -219,7 +240,7 @@ pub fn pick_all(d: &Drawing, space: &Space, p: Vec2, aperture: f64) -> Vec<Handl
     let Some(cands) = candidates(d, space, &ix, &probe.expand(aperture), true, true) else { return Vec::new() };
     cands
         .filter(|(e, known)| selectable(d, e) && (is_infinite(e) || bounds_of(d, e, *known).expand(aperture).intersects(&probe)))
-        .filter(|(e, _)| entity_distance(d, e, p, aperture / 4.0) <= aperture)
+        .filter(|(e, _)| entity_distance_within(d, e, p, aperture / 4.0, aperture) <= aperture)
         .map(|(e, _)| e.handle)
         .collect()
 }

@@ -42,7 +42,7 @@ struct ChunkIx {
 }
 
 impl ChunkIx {
-    fn build(d: &Drawing, key: usize, items: &[Arc<Entity>]) -> ChunkIx {
+    fn build(d: &Drawing, key: usize, items: &[Arc<Entity>], known: Option<&cadcraft_render::KnownBounds>) -> ChunkIx {
         let mut infinite = Vec::new();
         let bounds = items
             .iter()
@@ -51,7 +51,7 @@ impl ChunkIx {
                 if matches!(e.kind, EntityKind::XLine(_) | EntityKind::Ray(_)) {
                     infinite.push(u32::try_from(i).unwrap_or(u32::MAX));
                 }
-                entity_bounds(d, e, 0)
+                known.and_then(|k| k.get(e)).unwrap_or_else(|| entity_bounds(d, e, 0))
             })
             .collect();
         let serial = NEXT_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -132,6 +132,8 @@ impl SpatialIndex {
         let mut fresh = Vec::new();
         let mut kept = std::collections::HashSet::new();
         let mut offset = 0u32;
+        // What the screen build already measured is not measured again.
+        let known = cadcraft_render::known_bounds_of(d);
         for (key, items) in store.chunk_slices() {
             let c = match old.get(&key) {
                 Some(c) if c.ents.len() == items.len() => {
@@ -139,7 +141,7 @@ impl SpatialIndex {
                     c.clone()
                 }
                 _ => {
-                    let c = Arc::new(ChunkIx::build(d, key, items));
+                    let c = Arc::new(ChunkIx::build(d, key, items, known.as_ref()));
                     fresh.push(c.clone());
                     c
                 }

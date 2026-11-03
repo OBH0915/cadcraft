@@ -152,6 +152,7 @@ pub(super) fn draw_highlight_gpu(
     p: &egui::Painter,
     xf: &Xf,
     list: &DisplayList,
+    shared: Option<&std::sync::Arc<DisplayList>>,
     list_gen: u64,
     prims: impl FnOnce() -> Vec<usize>,
     sel: &[Handle],
@@ -159,21 +160,71 @@ pub(super) fn draw_highlight_gpu(
     look: Look,
     hl: (&mut Option<u64>, &crate::gpu::MeshSlot, &mut Vec2, &mut Vec<usize>),
     stencil: crate::gpu::Stencil,
+    layer: usize,
 ) {
     let (hl_key, hl_slot, hl_origin, hl_infinite) = hl;
-    let origin = crate::gpu::choose_origin(&list.bounds, xf.center, f64::from(xf.rect.height()) / xf.scale.max(1e-300));
-    let key = {
+    let wanted = crate::gpu::choose_origin(&list.bounds, xf.center, f64::from(xf.rect.height()) / xf.scale.max(1e-300));
+    // Keep the origin the mesh was built at while f32 positions relative to it stay
+    // exact to a small fraction of a pixel (within a million pixels of the view): panning moved
+    // the origin and rebuilt a large highlight at every frame.
+    let key_at = |o: Vec2| {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (list_gen, sel, origin.x.to_bits(), origin.y.to_bits(), color.to_array(), look.width.to_bits(), look.dashed).hash(&mut h);
+        (list_gen, sel, o.x.to_bits(), o.y.to_bits(), color.to_array(), look.width.to_bits(), look.dashed).hash(&mut h);
         h.finish()
     };
+    let same_content = *hl_key == Some(key_at(*hl_origin));
+    let near_enough = (*hl_origin - xf.center).len() * xf.scale < 1.0e6;
+    let origin = if same_content && near_enough { *hl_origin } else { wanted };
+    let key = key_at(origin);
     if *hl_key != Some(key) {
         let prims = prims();
-        let mesh = crate::gpu::build_highlight_mesh(list, &prims, origin, color.to_array(), look.width, look.dashed);
-        *hl_infinite = prims.into_iter().filter(|&i| list.prims.get(i).is_some_and(|p| matches!(p.kind, Kind::Infinite { .. }))).collect();
-        if let Ok(mut slot) = hl_slot.lock() {
-            *slot = Some(mesh);
+        *hl_infinite = prims.iter().copied().filter(|&i| list.prims.get(i).is_some_and(|p| matches!(p.kind, Kind::Infinite { .. }))).collect();
+        let wanted_key = HIGHLIGHT_WANTED.get(layer);
+        if let Some(w) = wanted_key {
+            w.store(key, std::sync::atomic::Ordering::SeqCst);
+        }
+        let points: usize = prims.iter().filter_map(|&i| list.prims.get(i)).map(|p| p.len as usize).sum();
+        if points >= HIGHLIGHT_ASYNC_FROM && wanted_key.is_some() {
+            // A highlight this large (a site plan held in one block) is built on a
+            // worker from a copy of its primitives and shows a moment later; building it here
+            // stalled the pointer for 60-90 ms each time the hovered object changed. A build
+            // that is overtaken by a newer one is dropped.
+            // The canvas list is shared with the worker; another list (a viewport's) is copied.
+            let (source, chosen) = match shared {
+                Some(l) => (std::sync::Arc::clone(l), prims.clone()),
+                None => {
+                    let sub = sub_list(list, &prims);
+                    let all = (0..sub.prims.len()).collect();
+                    (std::sync::Arc::new(sub), all)
+                }
+            };
+            if let Ok(mut slot) = hl_slot.lock() {
+                *slot = None;
+            }
+            let slot = hl_slot.clone();
+            let ctx = p.ctx().clone();
+            let (rgba, width, dashed) = (color.to_array(), look.width, look.dashed);
+            let spawned = std::thread::Builder::new().name("highlight".into()).spawn(move || {
+                let mesh = crate::gpu::build_highlight_mesh(&source, &chosen, origin, rgba, width, dashed);
+                if let Ok(mut s) = slot.lock()
+                    && HIGHLIGHT_WANTED.get(layer).is_some_and(|w| w.load(std::sync::atomic::Ordering::SeqCst) == key)
+                {
+                    *s = Some(mesh);
+                }
+                ctx.request_repaint();
+            });
+            if spawned.is_err() {
+                let mesh = crate::gpu::build_highlight_mesh(list, &prims, origin, color.to_array(), look.width, look.dashed);
+                if let Ok(mut slot) = hl_slot.lock() {
+                    *slot = Some(mesh);
+                }
+            }
+        } else {
+            let mesh = crate::gpu::build_highlight_mesh(list, &prims, origin, color.to_array(), look.width, look.dashed);
+            if let Ok(mut slot) = hl_slot.lock() {
+                *slot = Some(mesh);
+            }
         }
         *hl_key = Some(key);
         *hl_origin = origin;
@@ -187,12 +238,34 @@ pub(super) fn draw_highlight_gpu(
             offset: [(hl_origin.x - xf.center.x) as f32, (hl_origin.y - xf.center.y) as f32],
             scale: xf.scale as f32,
             center: [center.x, center.y],
-            layer: crate::gpu::LAYER_HIGHLIGHT,
+            layer,
             xform: crate::gpu::IDENTITY_XFORM,
             dash: if look.dashed { 10.0 } else { 0.0 },
             stencil,
         },
     ));
+}
+
+/// Per GPU layer, the highlight mesh the canvas wants now (its key); a worker's
+/// build for an older one is not handed over.
+static HIGHLIGHT_WANTED: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Highlight vertices from which the mesh is built on a worker thread.
+const HIGHLIGHT_ASYNC_FROM: usize = 200_000;
+
+/// The primitives `prims` of `list` as a list of their own (copied, for a worker thread).
+fn sub_list(list: &DisplayList, prims: &[usize]) -> DisplayList {
+    let mut out = DisplayList::default();
+    for p in prims.iter().filter_map(|&i| list.prims.get(i)) {
+        let pts = list.points(p);
+        let mut q = *p;
+        let buf = if matches!(p.kind, Kind::Tris | Kind::Mask) { &mut out.tris } else { &mut out.verts };
+        q.start = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        q.len = u32::try_from(pts.len()).unwrap_or(u32::MAX);
+        buf.extend_from_slice(pts);
+        out.prims.push(q);
+    }
+    out
 }
 
 /// Draw a MOVE/COPY/ROTATE/SCALE preview the way the drawing itself is drawn: the dragged
@@ -611,5 +684,38 @@ mod zoomed_highlight_tests {
         assert_eq!(dashed_rect(SCREEN, small, stroke, 4.0, 4.0).len(), 10 + 5 + 10 + 5);
         // Off screen, nothing.
         assert!(dashed_rect(SCREEN, small.translate(egui::vec2(5000.0, 0.0)), stroke, 4.0, 4.0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sub_list_tests {
+    use super::*;
+
+    #[test]
+    fn a_highlight_built_from_copied_primitives_is_the_one_built_from_the_list() {
+        let p = |kind, start, len| cadcraft_render::DPrim {
+            handle: Handle(7),
+            color: Rgb(255, 255, 255),
+            aci7: true,
+            lw: 0.0,
+            transparency: 0,
+            kind,
+            start,
+            len,
+        };
+        let list = DisplayList {
+            verts: vec![Vec2::new(9.0, 9.0), Vec2::new(0.0, 0.0), Vec2::new(2.0, 0.0), Vec2::new(2.0, 3.0), Vec2::new(5.0, 5.0)],
+            tris: vec![Vec2::new(8.0, 8.0), Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)],
+            prims: vec![p(Kind::Polyline, 0, 1), p(Kind::Polyline, 1, 3), p(Kind::Tris, 1, 3), p(Kind::Point, 4, 1)],
+            ..Default::default()
+        };
+        let chosen = [1, 2, 3];
+        let sub = sub_list(&list, &chosen);
+        assert_eq!(sub.prims.len(), 3);
+        for dashed in [false, true] {
+            let from_list = crate::gpu::build_highlight_mesh(&list, &chosen, Vec2::new(1.0, 1.0), [1, 2, 3, 255], 2.0, dashed);
+            let from_copy = crate::gpu::build_highlight_mesh(&sub, &[0, 1, 2], Vec2::new(1.0, 1.0), [1, 2, 3, 255], 2.0, dashed);
+            assert_eq!((from_list.quads, from_list.tris), (from_copy.quads, from_copy.tris));
+        }
     }
 }
